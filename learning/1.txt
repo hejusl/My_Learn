@@ -1,0 +1,882 @@
+CREATE OR REPLACE
+package body weixin_hd2svc is
+
+  procedure cj
+  (
+    p_userid      in number, --用户编号
+    p_usedchance    out number,--已用次数
+    p_prizetype out number,--奖品类型
+    p_prizeid out number,--奖品编号
+    p_money out number,--ipx为-1
+    p_outcode out string,--返回码
+    p_outinfo out string--返回信息
+
+  )is
+  v_prizetype number:= 0;
+  v_prizeid number := 0;
+  v_ipxrate number;
+  v_ipxprizeid number;
+  v_ipxwin number;
+
+  v_begindate date;
+  v_enddate date;
+  v_jbrate number;
+  v_hbrate number;
+  v_hbiswin number;
+  v_hbmoney number;
+  v_jbmoney number;
+  v_jbprizeid number;
+  v_newmoney number;
+  v_rowcount number;
+  v_rownum number;
+  v_subscribe number;
+  v_isrobot number;
+  begin
+    select min(fbdate),max(fbdate) into v_begindate,v_enddate from cjyx_prizefb;
+    if sysdate >= v_enddate + 1
+    then
+      p_outcode := 10001;
+      p_outinfo := '抽奖已结束';
+      return;
+    end if;
+
+    if sysdate < v_begindate
+    then
+      p_outcode := 10002;
+      p_outinfo := '抽奖未开始';
+      return;
+    end if;
+
+    select subscribe into v_subscribe from weixin_user
+    where user_id = p_userid;
+    if v_subscribe = 0 then
+      p_outcode := 11000;
+      p_outinfo := '未关注用户不能参与抽奖,请先关注';
+      return;
+    end if;
+
+    select is_robot into v_isrobot from weixin_user
+    where user_id = p_userid;
+
+    --扣除次数
+    update cjyx_userchance a
+    set a.usedchance = a.usedchance + 1
+    where a.userid = p_userid
+    and a.usedchance < a.daychance
+    and a.usedchance < 3
+    returning a.usedchance into p_usedchance;
+
+
+    if sql%rowcount < 1 then
+      rollback;
+      p_outcode := 10003;
+      p_outinfo := '抽奖次数已用完';
+      return;
+    end if;
+
+    --commit;
+
+    if v_isrobot = 1 then
+      goto robot;
+    end if;
+
+
+
+      --取ipx中奖率
+      getipxrate(v_ipxrate);
+     
+      ----ipx是否中奖
+      if trunc(dbms_random.value(1,1000000)) <= trunc(1000000 * v_ipxrate) then
+
+        update cjyx_prizelist a
+        set a.isused = 1,a.winuserid =p_userid,a.updatedate = sysdate
+        where exists
+        (
+          select 1 from
+          (
+            select prizeid from
+            (
+              select prizeid from cjyx_prizelist
+              where prizetype = 1
+              and isused = 0
+              order by dbms_random.value()
+            )where rownum = 1
+           )b where a.prizeid = b.prizeid
+         )
+         returning a.prizeid into v_ipxprizeid;
+
+
+         v_ipxwin := sql%rowcount;
+
+
+         if v_ipxwin = 1 then
+           p_prizetype := 1;
+           p_prizeid := v_ipxprizeid;
+           p_outcode := 10000;
+           p_outinfo := '中奖啦';
+           p_money := -1;
+           --抽奖流水
+           insert into cjyx_cjrecord
+           (recordid, userid, cjdate, iswin, prizetype, prizeid, createdate,recordmoney)
+           values
+           (s_cjyx_sqid.nextval, p_userid, sysdate, 1, 1, v_ipxprizeid, sysdate,0);
+           --中奖流水
+           insert into cjyx_winlist
+           (winlistid, userid, prizetype, prizeid,createdate,winmoney)
+           values
+           (s_cjyx_sqid.nextval, p_userid, 1, v_ipxprizeid,sysdate,0);
+           update cjyx_userchance set ipxwin = 1 where userid = p_userid;
+           commit;
+           return;
+         else
+           --ipx中奖并发导致未中奖
+           --去抽红包
+           null;
+         end if;
+     end if;
+
+    --其他奖品是否中奖
+    --红包是否中奖
+    select fbhbwinrate into v_hbrate from cjyx_prizefb
+    where fbdate = trunc(sysdate)
+    and rownum = 1;
+    if trunc(dbms_random.value(0,100000)) <= trunc(100000 * v_hbrate) then
+    --红包中奖逻辑
+    select count(1) into v_rowcount from cjyx_prizelist
+    where prizetype > 1 and prizetype < 5
+    and isused = 0
+    and fbdate <= sysdate;
+    v_rownum := trunc(dbms_random.value(1,v_rowcount+1));
+    update cjyx_prizelist a
+    set a.isused = 1,a.winuserid = p_userid,a.updatedate = sysdate
+    where exists
+      (
+        select 1 from
+        (
+         select prizeid from
+          (
+            select prizeid,rownum rn from cjyx_prizelist
+            where prizetype > 1
+            and isused = 0
+            and fbdate <= sysdate
+          )where rn = v_rownum
+
+         )b where a.prizeid = b.prizeid
+       )
+       returning a.prizeid,a.prizetype,a.hbmoney into v_prizeid,v_prizetype,v_hbmoney;
+       v_hbiswin := sql%rowcount;
+       if v_hbiswin = 0 then
+         --并发导致未中奖
+         ----金币是否中奖
+         goto jbiswin;
+       end if;
+       --红包中奖
+       --记录抽奖流水
+       insert into cjyx_cjrecord
+       (recordid, userid, cjdate, iswin, prizetype, prizeid,recordmoney, createdate)
+       values
+       (s_cjyx_sqid.nextval, p_userid, sysdate, 1, v_prizetype, v_prizeid,v_hbmoney, sysdate);
+
+       --中奖流水
+       insert into cjyx_winlist
+       (winlistid, userid, prizetype, prizeid,
+        createdate,winmoney)
+       values
+       (s_cjyx_sqid.nextval, p_userid, v_prizetype, v_prizeid,sysdate,v_hbmoney);
+
+
+       update weixin_user_account
+       set account_redpack = account_redpack + v_hbmoney,account_update_date = sysdate
+       where account_user_id = p_userid
+       returning account_redpack into v_newmoney;
+
+       insert into weixin_user_bill
+         (bill_id, bill_user_id, bill_account_type,
+         bill_type, bill_change, bill_balance,
+         bill_create_date, bill_activity_id, bill_from_table,
+         bill_foreignid, bill_desc)
+       select
+         s_cjyx_sqid.nextval, p_userid, 2,
+         102, v_hbmoney, v_newmoney,
+         sysdate, 2, 'cjyx_winlist',
+         v_prizeid, '福彩快开公众号“超级英雄”游戏活动 抽中红包' from dual;
+       update cjyx_userchance set hbwin = 1 where userid = p_userid;
+       p_outcode := 10000;
+       p_outinfo := '中奖啦';
+       p_prizetype := v_prizetype;
+       p_prizeid := v_prizeid;
+       p_money := v_hbmoney;
+       commit;
+       return;
+    else
+      goto jbiswin;
+    end if;
+    --金币逻辑
+    <<jbiswin>>
+    begin
+      select max(jbwinrate) into v_jbrate from cjyx_jbcfg;
+      if trunc(dbms_random.value(0,100000)) <= trunc(100000 * v_jbrate) then
+        v_prizetype := 5;
+        select jbmoney into v_jbmoney from
+        (
+          select jbid,jbmoney from cjyx_jbcfg
+          order by dbms_random.value
+        )where rownum = 1;
+        v_jbprizeid := s_cjyx_sqid.nextval;
+        insert into cjyx_cjrecord
+        (recordid, userid, cjdate, iswin, prizetype, prizeid,recordmoney, createdate)
+        values
+        (s_cjyx_sqid.nextval, p_userid, sysdate, 1, v_prizetype,v_jbprizeid,v_jbmoney,sysdate);
+        insert into cjyx_winlist
+        (winlistid, userid, prizetype, prizeid,
+        createdate,winmoney)
+        values
+        (s_cjyx_sqid.nextval, p_userid, v_prizetype, v_prizeid,sysdate,v_jbmoney);
+       update weixin_user_account
+       set account_gold = account_gold + v_jbmoney,account_update_date = sysdate
+       where account_user_id = p_userid
+       returning account_gold into v_newmoney;
+
+       insert into weixin_user_bill
+         (bill_id, bill_user_id, bill_account_type,
+         bill_type, bill_change, bill_balance,
+         bill_create_date, bill_activity_id, bill_from_table,
+         bill_foreignid, bill_desc)
+       select
+         s_weixin_user_bill.nextval, p_userid, 3,
+         102, v_jbmoney, v_newmoney,
+         sysdate, 2, 'cjyx_winlist',
+         v_jbprizeid, '福彩快开公众号“超级英雄”游戏活动 抽中金币' from dual;
+
+
+        
+        p_outcode := 10000;
+        p_outinfo := '中奖啦';
+
+        p_prizetype := v_prizetype;
+        p_prizeid := v_prizeid;
+        p_money := v_jbmoney;
+        commit;
+        return;
+      else
+        p_outcode := 10004;
+        p_outinfo := '未中奖';
+        --记录抽奖流水
+        insert into cjyx_cjrecord
+          (recordid, userid, cjdate, iswin, prizetype, prizeid, createdate)
+        values
+          (s_cjyx_sqid.nextval, p_userid, sysdate, 0, -1, -1, sysdate);
+        commit;
+        return;
+      end if;
+    end jbiswin;
+
+    <<robot>>
+    begin
+      if v_isrobot = 1 then
+        select fbhbwinrate into v_hbrate from cjyx_prizefb
+        where fbdate = trunc(sysdate)
+        and rownum = 1;
+        if trunc(dbms_random.value(0,100000)) <= trunc(100000 * v_hbrate) then
+          --中奖逻辑
+        select count(1) into v_rowcount from cjyx_prizelist
+        where prizetype = 2
+        and hbmoney <= 5
+        and isused = 0
+        and fbdate <= sysdate;
+        v_rownum := trunc(dbms_random.value(1,v_rowcount+1));
+          update cjyx_prizelist a
+          set a.isused = 1,a.winuserid = p_userid,a.updatedate = sysdate
+          where exists
+          (
+            select 1 from
+            (
+             select prizeid from
+              (
+                select prizeid,rownum rn from cjyx_prizelist
+                where prizetype = 2
+                and hbmoney <= 5
+                and isused = 0
+                and fbdate <= sysdate
+              )where rn = v_rownum
+             )b where a.prizeid = b.prizeid
+           )
+           returning a.prizeid,a.prizetype,a.hbmoney into v_prizeid,v_prizetype,v_hbmoney;
+           insert into cjyx_cjrecord
+           (recordid, userid, cjdate, iswin, prizetype, prizeid,recordmoney, createdate)
+           values
+           (s_cjyx_sqid.nextval, p_userid, sysdate, 1, v_prizetype, v_prizeid,v_hbmoney, sysdate);
+           insert into cjyx_winlist
+           (winlistid, userid, prizetype, prizeid,
+            createdate,winmoney)
+           values
+           (s_cjyx_sqid.nextval, p_userid, v_prizetype, v_prizeid,sysdate,v_hbmoney);
+
+           update weixin_user_account
+           set account_redpack = account_redpack + v_hbmoney,account_update_date = sysdate
+           where account_user_id = p_userid
+           returning account_redpack into v_newmoney;
+
+           insert into weixin_user_bill
+             (bill_id, bill_user_id, bill_account_type,
+             bill_type, bill_change, bill_balance,
+             bill_create_date, bill_activity_id, bill_from_table,
+             bill_foreignid, bill_desc)
+           select
+             s_weixin_user_bill.nextval, p_userid, 2,
+             102, v_hbmoney, v_newmoney,
+             sysdate, 2, 'cjyx_winlist',
+             v_prizeid, '福彩快开公众号“超级英雄”游戏活动 抽中红包' from dual;
+           update cjyx_userchance set hbwin = 1 where userid = p_userid;
+           
+           p_outcode := 10000;
+           p_outinfo := '中奖啦';
+           p_prizetype := v_prizetype;
+           p_prizeid := v_prizeid;
+           p_money := v_hbmoney;
+           commit;
+           return;
+         else
+           goto jbiswin;
+         end if;
+      end if;
+    end;
+    exception
+      when others then
+      rollback;
+      p_outcode := substr(sqlcode, 1, 600);
+      p_outinfo := substr(sqlerrm, 1, 1200);
+
+  end;
+
+  procedure resetchance
+  is
+  begin
+    update cjyx_userchance
+    set daychance = 2,usedchance = 0,remainchance = 2,share_chance = 0,share_chancedate = null ,updatedate = sysdate;
+    commit;
+  end;
+
+
+
+  procedure initprizefb
+  (
+    p_begindate in date
+  )is
+
+
+  cursor v_cursor is
+  select fbdate,fbhbcount,fbhbmoney,fbhbcountprop1,
+  fbhbmoneyprop1,fbhbcountprop2,fbhbmoneyprop2,fbhbcountprop3,
+  fbhbmoneyprop3 from  cjyx_prizefb
+  where fbdate >= p_begindate
+  order by fbdate;
+  v_row v_cursor%rowtype;
+
+  cursor v_cursor2 is select fbdate from cjyx_prizefb
+  where fbdate >= p_begindate
+  order by fbdate;
+  v_row2 v_cursor2%rowtype;
+  v_count number :=0;
+  v_daysecs number := 86400; --60*60*24
+  v_fbdate date;
+  v_hbmoneyprop3 number;
+  v_hbcountprop3 number;
+  v_hbmoneyprop2 number;
+  v_hbcountprop2 number;
+  v_hbmoneyprop1 number;
+  v_hbcountprop1 number;
+  v_prizeid number;
+  v_prizetype  number;
+  v_point1 number;
+  v_point2 number;
+  v_point3 number;
+  v_point4 number;
+  v_point5 number;
+  v_point6 number;
+  v_point7 number;
+  v_point8 number;
+  v_point9 number;
+  v_point10 number;
+  v_i  number;
+  v_hbmoney number;
+  v_interval number;
+  v_prop3allmoney number;
+  v_prop2allmoney number;
+  v_prop1allmoney number;
+  v_diff number;
+  v_updatecount number;
+
+  begin
+
+    delete from cjyx_prizelist where fbdate >= p_begindate;
+
+    execute immediate 'truncate table cjyx_prizelist1';
+    execute immediate 'truncate table cjyx_prizelist2';
+    execute immediate 'truncate table cjyx_prizelist3';
+
+    execute immediate 'truncate table cjyx_prizetemp1';
+    execute immediate 'truncate table cjyx_prizetemp2';
+    execute immediate 'truncate table cjyx_prizetemp3';
+
+    select point1, point2, point3, point4, point5, point6, point7, point8, point9, point10
+    into v_point1, v_point2, v_point3, v_point4, v_point5, v_point6, v_point7, v_point8, v_point9, v_point10
+    from cjyx_pro1cfg;
+
+    for v_row in v_cursor
+    loop
+      v_fbdate := v_row.fbdate;
+      v_i := 1;
+      v_interval :=0;
+      v_hbmoneyprop3 := v_row.fbhbmoney*100*v_row.fbhbmoneyprop3;
+      v_hbcountprop3 := v_row.fbhbcount*v_row.fbhbcountprop3;
+      v_interval := v_daysecs / v_row.fbhbcount;
+      while v_i <= v_hbcountprop3 loop
+        if (v_hbcountprop3-v_i) * 100 <= v_hbmoneyprop3 then
+          v_hbmoney := trunc(dbms_random.value(101,501));
+        else
+          if trunc(v_hbmoneyprop3/(v_hbcountprop3+1-v_i)) < 101 then
+            v_hbmoney := 101;
+          else
+            v_hbmoney := trunc(v_hbcountprop3/(v_hbmoneyprop3+1-v_i));
+          end if;
+        end if;
+        insert into cjyx_prizetemp3
+          (fbdate,prizeid, prizetype, isused, winuserid, updatedate, createdate,isdo,hbmoney)
+        values
+          (v_fbdate,s_cjyx_sqid.nextval,4, 0, null, null, sysdate,0,v_hbmoney);
+        v_i := v_i + 1;
+        v_hbmoneyprop3 := v_hbmoneyprop3 - v_hbmoney;
+        if v_fbdate + v_interval/60/60/24 >= v_row.fbdate+1 then
+          v_fbdate := v_row.fbdate + trunc(dbms_random.value(0,86400-1))/60/60/24;
+        else
+          v_fbdate := v_fbdate + v_interval/60/60/24;
+        end if;
+      end loop;
+      select sum(hbmoney) into v_prop3allmoney from cjyx_prizetemp3
+      where trunc(fbdate) = v_row.fbdate ;
+      v_diff := v_prop3allmoney - v_row.fbhbmoney*100*v_row.fbhbmoneyprop3;
+
+      while abs(v_diff) > 0  loop
+          if v_diff > 0 then
+            update cjyx_prizetemp3 set hbmoney = hbmoney -1
+            where hbmoney > 102
+            and trunc(fbdate) = v_row.fbdate
+            and rownum <= v_diff;
+            v_updatecount := sql%rowcount;
+            v_diff := v_diff - v_updatecount;
+          end if;
+          if v_diff < 0 then
+            update cjyx_prizetemp3 set hbmoney = hbmoney + 1
+            where hbmoney < 499
+            and trunc(fbdate) = v_row.fbdate
+            and rownum <= abs(v_diff);
+            v_updatecount := sql%rowcount;
+            v_diff := v_diff + v_updatecount;
+          end if;
+      end loop;
+      commit;
+      v_i := 1;
+      v_hbmoney := 0;
+      v_hbmoneyprop2 := v_row.fbhbmoney*100*v_row.fbhbmoneyprop2;
+      v_hbcountprop2 := v_row.fbhbcount*v_row.fbhbcountprop2;
+      while v_i <= v_hbcountprop2 loop
+        if (v_hbcountprop2-v_i) * 10 <= v_hbmoneyprop2 then
+          v_hbmoney := trunc(dbms_random.value(11,101));
+        else
+          if trunc(v_hbmoneyprop2/(v_hbcountprop2+1-v_i)) < 11 then
+            v_hbmoney := 11;
+          else
+            v_hbmoney := trunc(v_hbmoneyprop2/(v_hbcountprop2+1-v_i));
+          end if;
+        end if;
+        insert into cjyx_prizetemp2
+          (fbdate,prizeid, prizetype, isused, winuserid, updatedate, createdate,isdo,hbmoney)
+        values
+          (v_fbdate,s_cjyx_sqid.nextval,3, 0, null, null, sysdate,0,v_hbmoney);
+        v_i := v_i + 1;
+        v_hbmoneyprop2 := v_hbmoneyprop2 - v_hbmoney;
+        if v_fbdate + v_interval/60/60/24 >= v_row.fbdate+1 then
+          v_fbdate := v_row.fbdate + trunc(dbms_random.value(0,86400-1))/60/60/24;
+        else
+          v_fbdate := v_fbdate + v_interval/60/60/24;
+        end if;
+      end loop;
+
+      select sum(hbmoney) into v_prop2allmoney from cjyx_prizetemp2
+      where trunc(fbdate)  = v_row.fbdate ;
+      v_diff := v_prop2allmoney - v_row.fbhbmoney*100*v_row.fbhbmoneyprop2;
+
+      while abs(v_diff) > 0 loop
+        if v_diff > 0 then
+          update cjyx_prizetemp2 set hbmoney = hbmoney -1
+          where hbmoney > 11
+          and trunc(fbdate) = v_row.fbdate
+          and rownum <= v_diff;
+          v_updatecount := sql%rowcount;
+          v_diff := v_diff - v_updatecount;
+        end if;
+
+        if v_diff < 0 then
+          update cjyx_prizetemp2 set hbmoney = hbmoney + 1
+          where hbmoney < 99
+          and trunc(fbdate) = v_row.fbdate
+          and rownum <= abs(v_diff);
+          v_updatecount := sql%rowcount;
+          v_diff := v_diff + v_updatecount;
+        end if;
+      end loop;
+
+      commit;
+
+      --0.01
+      v_i := 1;
+      while v_i <= v_row.fbhbcount*v_point1 loop
+        insert into cjyx_prizetemp1
+          (fbdate,prizeid, prizetype, isused, winuserid, updatedate, createdate,isdo,hbmoney)
+        values
+          (v_fbdate,s_cjyx_sqid.nextval,2, 0, null, null, sysdate,0,1);
+        v_i := v_i + 1;
+        if v_fbdate + v_interval/60/60/24 >= v_row.fbdate +1 then
+          v_fbdate := v_row.fbdate + trunc(dbms_random.value(0,86400-1))/60/60/24;
+        else
+          v_fbdate := v_fbdate + v_interval/60/60/24;
+        end if;
+      end loop;
+      commit;
+      --0.02
+      v_i := 1;
+      while v_i <= v_row.fbhbcount*v_point2 loop
+        insert into cjyx_prizetemp1
+          (fbdate,prizeid, prizetype, isused, winuserid, updatedate, createdate,isdo,hbmoney)
+        values
+          (v_fbdate,s_cjyx_sqid.nextval,2, 0, null, null, sysdate,0,2);
+        v_i := v_i + 1;
+        if v_fbdate + v_interval/60/60/24 >= v_row.fbdate+1 then
+          v_fbdate := v_row.fbdate + trunc(dbms_random.value(0,86400-1))/60/60/24;
+        else
+          v_fbdate := v_fbdate + v_interval/60/60/24;
+        end if;
+      end loop;
+      commit;
+      --0.03
+      v_i := 1;
+      while v_i <= v_row.fbhbcount*v_point3 loop
+        insert into cjyx_prizetemp1
+          (fbdate,prizeid, prizetype, isused, winuserid, updatedate, createdate,isdo,hbmoney)
+        values
+          (v_fbdate,s_cjyx_sqid.nextval,2, 0, null, null, sysdate,0,3);
+        v_i := v_i + 1;
+        if v_fbdate + v_interval/60/60/24 > v_row.fbdate+1 then
+          v_fbdate := v_row.fbdate + trunc(dbms_random.value(0,86400-1))/60/60/24;
+        else
+          v_fbdate := v_fbdate + v_interval/60/60/24;
+        end if;
+      end loop;
+      commit;
+      --0.04
+      v_i := 1;
+      while v_i <= v_row.fbhbcount*v_point4 loop
+        insert into cjyx_prizetemp1
+          (fbdate,prizeid, prizetype, isused, winuserid, updatedate, createdate,isdo,hbmoney)
+        values
+          (v_fbdate,s_cjyx_sqid.nextval,2, 0, null, null, sysdate,0,4);
+        v_i := v_i + 1;
+        if v_fbdate + v_interval/60/60/24 >= v_row.fbdate+1 then
+          v_fbdate := v_row.fbdate + trunc(dbms_random.value(0,86400-1))/60/60/24;
+        else
+          v_fbdate := v_fbdate + v_interval/60/60/24;
+        end if;
+      end loop;
+      commit;
+      --0.05
+      v_i := 1;
+      while v_i <= v_row.fbhbcount*v_point5 loop
+        insert into cjyx_prizetemp1
+          (fbdate,prizeid, prizetype, isused, winuserid, updatedate, createdate,isdo,hbmoney)
+        values
+          (v_fbdate,s_cjyx_sqid.nextval,2, 0, null, null, sysdate,0,5);
+        v_i := v_i + 1;
+        if v_fbdate + v_interval/60/60/24 >= v_row.fbdate+1 then
+          v_fbdate := v_row.fbdate + trunc(dbms_random.value(0,86400-1))/60/60/24;
+        else
+          v_fbdate := v_fbdate + v_interval/60/60/24;
+        end if;
+      end loop;
+      commit;
+      --0.06
+      v_i := 1;
+      while v_i <= v_row.fbhbcount*v_point6 loop
+        insert into cjyx_prizetemp1
+          (fbdate,prizeid, prizetype, isused, winuserid, updatedate, createdate,isdo,hbmoney)
+        values
+          (v_fbdate,s_cjyx_sqid.nextval,2, 0, null, null, sysdate,0,6);
+        v_i := v_i + 1;
+        if v_fbdate + v_interval/60/60/24 >= v_row.fbdate +1 then
+          v_fbdate := v_row.fbdate + trunc(dbms_random.value(0,86400-1))/60/60/24;
+        else
+          v_fbdate := v_fbdate + v_interval/60/60/24;
+        end if;
+      end loop;
+      commit;
+      --0.07
+      v_i := 1;
+      while v_i <= v_row.fbhbcount*v_point7 loop
+        insert into cjyx_prizetemp1
+          (fbdate,prizeid, prizetype, isused, winuserid, updatedate, createdate,isdo,hbmoney)
+        values
+          (v_fbdate,s_cjyx_sqid.nextval,2, 0, null, null, sysdate,0,7);
+        v_i := v_i + 1;
+        if v_fbdate + v_interval/60/60/24 >= v_row.fbdate+1 then
+          v_fbdate := v_row.fbdate + trunc(dbms_random.value(0,86400-1))/60/60/24;
+        else
+          v_fbdate := v_fbdate + v_interval/60/60/24;
+        end if;
+      end loop;
+      commit;
+      --0.08
+      v_i := 1;
+      while v_i <= v_row.fbhbcount*v_point8 loop
+        insert into cjyx_prizetemp1
+          (fbdate,prizeid, prizetype, isused, winuserid, updatedate, createdate,isdo,hbmoney)
+        values
+          (v_fbdate,s_cjyx_sqid.nextval,2, 0, null, null, sysdate,0,8);
+        v_i := v_i + 1;
+        if v_fbdate + v_interval/60/60/24 >= v_row.fbdate+1 then
+          v_fbdate := v_row.fbdate + trunc(dbms_random.value(0,86400-1))/60/60/24;
+        else
+          v_fbdate := v_fbdate + v_interval/60/60/24;
+        end if;
+      end loop;
+      commit;
+      --0.09
+      v_i := 1;
+      while v_i <= v_row.fbhbcount*v_point9 loop
+        insert into cjyx_prizetemp1
+          (fbdate,prizeid, prizetype, isused, winuserid, updatedate, createdate,isdo,hbmoney)
+        values
+          (v_fbdate,s_cjyx_sqid.nextval,2, 0, null, null, sysdate,0,9);
+        v_i := v_i + 1;
+        if v_fbdate + v_interval/60/60/24 >= v_row.fbdate+1 then
+          v_fbdate := v_row.fbdate + trunc(dbms_random.value(0,86400-1))/60/60/24;
+        else
+          v_fbdate := v_fbdate + v_interval/60/60/24;
+        end if;
+      end loop;
+      commit;
+      --0.1
+      v_i := 1;
+      while v_i <= v_row.fbhbcount*v_point10 loop
+        insert into cjyx_prizetemp1
+          (fbdate,prizeid, prizetype, isused, winuserid, updatedate, createdate,isdo,hbmoney)
+        values
+          (v_fbdate,s_cjyx_sqid.nextval,2, 0, null, null, sysdate,0,10);
+        v_i := v_i + 1;
+        if v_fbdate + v_interval/60/60/24 >= v_row.fbdate + 1 then
+          v_fbdate := v_row.fbdate + trunc(dbms_random.value(0,86400-1))/60/60/24;
+        else
+          v_fbdate := v_fbdate + v_interval/60/60/24;
+        end if;
+      end loop;
+      commit;
+
+    end loop;
+
+    insert into cjyx_prizelist1
+    (fbdate,prizeid, prizetype, isused,createdate,hbmoney,rn)
+    select fbdate,prizeid, prizetype,0,sysdate,hbmoney,rank() over(partition by trunc(fbdate) order by fbdate) from
+    (
+      select fbdate,prizeid, prizetype,hbmoney from cjyx_prizetemp1
+      order by fbdate
+    );
+
+    insert into cjyx_prizelist2
+    (fbdate,prizeid, prizetype, isused,createdate,hbmoney,rn)
+    select fbdate,prizeid, prizetype,0,sysdate,hbmoney,rank() over(partition by trunc(fbdate) order by fbdate) from
+    (
+      select fbdate,prizeid, prizetype,hbmoney from cjyx_prizetemp2
+      order by fbdate
+    );
+
+    insert into cjyx_prizelist3
+    (fbdate,prizeid, prizetype, isused,createdate,hbmoney,rn)
+    select fbdate,prizeid, prizetype,0,sysdate,hbmoney,rank() over(partition by trunc(fbdate) order by fbdate) from
+    (
+      select fbdate,prizeid, prizetype,hbmoney from cjyx_prizetemp3
+      order by fbdate
+    );
+
+    commit;
+
+    --select 1/0 into v_count from dual ;
+    for v_row2 in v_cursor2
+    loop
+
+      merge into cjyx_prizelist1 a
+      using
+      (
+        select fbdate,rownum rn from
+        (
+          select fbdate from cjyx_prizetemp1
+          where trunc(fbdate) = v_row2.fbdate
+          order by dbms_random.value()
+        )
+
+      )b
+      on ( a.rn = b.rn )
+      when matched then update
+      set a.fbdate = b.fbdate
+      where trunc(a.fbdate) = v_row2.fbdate;
+
+      merge into cjyx_prizelist2 a
+      using
+      (
+        select fbdate,rownum rn from
+        (
+          select fbdate from cjyx_prizetemp2
+          where trunc(fbdate) = v_row2.fbdate
+          order by dbms_random.value()
+        )
+
+      )b
+      on ( a.rn = b.rn )
+      when matched then update
+      set a.fbdate = b.fbdate
+      where trunc(a.fbdate) = v_row2.fbdate;
+
+
+      merge into cjyx_prizelist3 a
+      using
+      (
+        select fbdate,rownum rn from
+        (
+          select fbdate from cjyx_prizetemp3
+          where trunc(fbdate) = v_row2.fbdate
+          order by dbms_random.value()
+        )
+
+      )b
+      on ( a.rn = b.rn )
+      when matched then update
+      set a.fbdate = b.fbdate
+      where trunc(a.fbdate) = v_row2.fbdate;
+      commit;
+    end loop;
+
+
+    insert into cjyx_prizelist
+    select * from cjyx_prizelist1
+    union all
+    select * from cjyx_prizelist2
+    union all
+    select * from cjyx_prizelist3;
+
+    commit;
+
+
+    for v_row2 in v_cursor2
+    loop
+
+      merge into cjyx_prizelist a
+      using
+      (
+        select fbdate,rownum rn from
+        (
+          select fbdate from cjyx_prizelist
+          where trunc(fbdate) = v_row2.fbdate
+          order by dbms_random.value()
+        )
+
+      )b
+      on ( a.rn = b.rn )
+      when matched then update
+      set a.fbdate = b.fbdate
+      where trunc(a.fbdate) = v_row2.fbdate;
+
+      commit;
+    end loop;
+
+    commit;
+  end;
+
+  procedure createipx
+  is
+  v_ipxcount number:= 0;
+  begin
+
+    select count(1) into v_ipxcount from cjyx_prizelist
+    where prizetype = 1 ;
+    if v_ipxcount >= 1 then
+      return;
+    end if;
+
+
+    insert into cjyx_prizelist
+      (prizeid, prizetype, isused, winuserid, updatedate, createdate, fbdate)
+    values
+      (1, 1, 0, null, null, sysdate, sysdate );
+    commit;
+
+  end;
+
+
+    procedure getipxrate
+    (
+      p_rate out number
+    )is
+    v_week number;
+    v_weekday number;
+    v_rate1 number;
+    v_rate2 number;
+    v_rate3 number;
+    v_rate4 number;
+    v_begindate5 date;
+    v_begindate10 date;
+
+    v_fbday number;
+    v_ipxrate1 number;
+    v_ipxrate2 number;
+    v_ipxrate3 number;
+    v_remaincount number;
+    begin
+      select count(1) into v_remaincount from cjyx_prizelist 
+      where prizetype = 1
+      and isused = 0;
+      if  v_remaincount > 0 then
+        select max(fbday), max(fbipxwinrate1), max(fbipxwinrate2), max(fbipxwinrate3)
+        into v_fbday,v_ipxrate1,v_ipxrate2,v_ipxrate3 from cjyx_prizefb
+        where fbdate = trunc(sysdate);
+        select fbdate into v_begindate5 from cjyx_prizefb
+        where fbday = 5;
+        select fbdate into v_begindate10 from cjyx_prizefb
+        where fbday = 10;
+
+        if v_fbday >=1 and v_fbday <= 4 then
+          p_rate := 0;
+          return;
+        elsif v_fbday >= 5 and v_fbday <= 9 then
+          p_rate := ( v_ipxrate2 * ( power( (sysdate-v_begindate5)/5 ,4) ) ) + v_ipxrate3;
+        elsif v_fbday = 10 then
+          p_rate := ( v_ipxrate2 * ( power( (sysdate-v_begindate10)/1 ,4)) ) + v_ipxrate3;
+        else
+          p_rate := 0;
+          return;
+        end if;        
+      else
+        p_rate := 0;
+        return;  
+      end if; 
+
+
+    end;
+
+
+
+
+
+
+
+
+
+
+end weixin_hd2svc;
